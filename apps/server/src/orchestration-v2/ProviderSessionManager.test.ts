@@ -433,6 +433,7 @@ const makeProviderAdapter = Effect.fnUntraced(function* (
               resumeCount: current.resumeCount + 1,
             })).pipe(Effect.as(threadInput.providerThread)),
           startTurn: () => options.startTurn ?? Effect.void,
+          compactThread: () => Effect.void,
           steerTurn: () => Effect.void,
           interruptTurn: () =>
             Ref.update(state, (current) => ({
@@ -1407,6 +1408,82 @@ it.effect("ProviderSessionManagerV2 gives up on a provider that never confirms a
       Effect.provide(layerTest({ state, idleTimeoutMs: 60_000, interruptTurn: Effect.never })),
     );
   }),
+);
+
+it.effect.each(["startTurn", "compactThread"] as const)(
+  "ProviderSessionManagerV2 flags a quiet %s until the provider speaks",
+  (start) =>
+    Effect.gen(function* () {
+      const state = yield* Ref.make(emptyState);
+      yield* Effect.gen(function* () {
+        const eventSink = yield* EventSink.EventSinkV2;
+        const idAllocator = yield* IdAllocator.IdAllocatorV2;
+        const manager = yield* ProviderSessionManager.ProviderSessionManagerV2;
+        const projectionStore = yield* ProjectionStore.ProjectionStoreV2;
+        const now = yield* DateTime.now;
+        const threadId = ThreadId.make("thread-provider-session-manager-quiet-run");
+        const providerSessionId = yield* idAllocator.allocate.providerSession({
+          providerInstanceId: modelSelection.instanceId,
+          threadId,
+        });
+        yield* eventSink.write({
+          events: [yield* makeThreadCreatedEvent({ idAllocator, threadId, now })],
+        });
+        const runtime = yield* manager.open({
+          threadId,
+          providerSessionId,
+          modelSelection,
+          runtimePolicy,
+        });
+        const providerThread = makeProviderThread({
+          idAllocator,
+          threadId,
+          providerSessionId,
+          now,
+        });
+        const runId = idAllocator.derive.run({ threadId, ordinal: 1 });
+        const quiet = yield* manager.quietRuns.pipe(
+          Stream.map((runs) => runs.map((run) => run.threadId)),
+          Stream.take(3),
+          Stream.runCollect,
+          Effect.forkChild,
+        );
+        yield* runtime[start]!({
+          appThread: (yield* projectionStore.getThreadProjection(threadId)).thread,
+          threadId,
+          runId,
+          runOrdinal: 1,
+          providerTurnOrdinal: 1,
+          attemptId: idAllocator.derive.runAttempt({ runId, attemptOrdinal: 1 }),
+          rootNodeId: idAllocator.derive.rootNode({ runId }),
+          providerThread,
+          message: {
+            createdBy: "user",
+            creationSource: "web",
+            messageId: yield* idAllocator.allocate.message({ threadId, ordinal: 1 }),
+            text: "turn",
+            attachments: [],
+          },
+          modelSelection,
+          runtimePolicy,
+        });
+        yield* TestClock.adjust(ProviderSessionManager.QUIET_RUN_AFTER_MS);
+
+        const subscription = yield* runtime.subscribeEvents!;
+        const event = {
+          type: "provider_thread.updated",
+          driver: CODEX_DRIVER,
+          providerThread,
+        } as const;
+        yield* Queue.offer(
+          (yield* Ref.get(state)).eventQueues.get(String(providerSessionId))!,
+          event,
+        );
+        yield* subscription.events.pipe(Stream.runHead);
+        yield* TestClock.adjust("30 seconds");
+        assert.deepEqual(yield* Fiber.join(quiet), [[], [threadId], []]);
+      }).pipe(Effect.provide(layerTest({ state, idleTimeoutMs: 60 * 60_000 })));
+    }),
 );
 
 it.effect("ProviderSessionManagerV2 stops a session still opening when its layer shuts down", () =>

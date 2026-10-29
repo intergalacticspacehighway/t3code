@@ -159,7 +159,10 @@ import { useAtomCommand } from "../../state/use-atom-command";
 import { orchestrationEnvironment } from "../../state/orchestration";
 import { useDelayedStatus } from "../../lib/useDelayedStatus";
 import type { PendingUserInputDraftAnswer } from "@t3tools/client-runtime/state/pending-user-input";
-import type { RunStopPresentation } from "@t3tools/client-runtime/state/thread-execution";
+import {
+  quietRunSince,
+  type RunStopPresentation,
+} from "@t3tools/client-runtime/state/thread-execution";
 import type {
   PendingApproval,
   PendingUserInput,
@@ -549,6 +552,10 @@ function ThreadDetailBody(props: ThreadDetailScreenProps) {
   const canForceStop =
     useAtomValue(orchestrationEnvironment.forceStopThread.permissionAtom(props.environmentId)) &&
     props.serverConfig?.environment.capabilities.threadForceStop === true;
+  const quietSince =
+    props.activeWorkStartedAt === null
+      ? null
+      : quietRunSince(props.serverConfig, props.selectedThread.id);
   const [forceStoppingKey, setForceStoppingKey] = useState<string | null>(null);
   const forceStop = async () => {
     const threadKey = selectedThreadKey;
@@ -712,6 +719,35 @@ function ThreadDetailBody(props: ThreadDetailScreenProps) {
                   }),
               }
             : null,
+      };
+    }
+    if (quietSince !== null && contentPresentationKind === "ready") {
+      return {
+        kind: "quiet",
+        quietSince,
+        action: {
+          label: statusPending ? "Stopping..." : "Stop",
+          accessibilityLabel: "Stop the quiet turn",
+          disabled: !props.canOperateThread || statusPending,
+          onPress: () =>
+            Dialog.alert(
+              "Stop this turn?",
+              "The agent has sent nothing for a while. A long tool may still be running.",
+              [
+                { text: "Cancel", style: "cancel" },
+                { text: "Stop", onPress: () => void runStatusAction("stop") },
+                ...(canForceStop
+                  ? [
+                      {
+                        text: "Force stop",
+                        style: "destructive" as const,
+                        onPress: () => void forceStop(),
+                      },
+                    ]
+                  : []),
+              ],
+            ),
+        },
       };
     }
     if (props.isCompacting && contentPresentationKind === "ready") {
