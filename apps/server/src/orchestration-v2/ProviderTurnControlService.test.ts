@@ -283,6 +283,7 @@ it.effect(
           closeInstance: () => Effect.void,
           release: () => Effect.void,
           detach: () => Effect.void,
+          otherWorkingThreads: () => Effect.succeed([]),
         }),
       );
       const layerControl = ProviderTurnControlService.layer.pipe(

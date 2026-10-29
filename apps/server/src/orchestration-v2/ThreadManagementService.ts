@@ -14,6 +14,9 @@ import {
   MessageId,
   OrchestrationV2StopWorkflowError,
   type OrchestrationV2StopWorkflowInput,
+  OrchestrationV2ForceStopThreadError,
+  type OrchestrationV2ForceStopThreadInput,
+  type OrchestrationV2ForceStopThreadResult,
   type ModelSelection,
   type OrchestrationV2Actor,
   type OrchestrationV2Command,
@@ -30,6 +33,7 @@ import {
   ProjectId,
   PROVIDER_SEND_TURN_MAX_FILE_BYTES,
   ProviderInstanceId,
+  type ProviderSessionId,
   resolveProjectProviderInstanceEnabled,
   RunId,
   type ScheduledTaskId,
@@ -38,6 +42,8 @@ import {
 } from "@t3tools/contracts";
 import { delegatedTaskProgress } from "@t3tools/provider-core/server/subagentProjection";
 import { threadTranscriptHeader } from "@t3tools/shared/threadTranscript";
+import { AgentScope } from "@t3tools/shared/AgentScope";
+import * as Clock from "effect/Clock";
 import * as Context from "effect/Context";
 import * as DateTime from "effect/DateTime";
 import * as Duration from "effect/Duration";
@@ -454,6 +460,13 @@ export interface ThreadManagementServiceShape {
   readonly stopWorkflow: (
     input: OrchestrationV2StopWorkflowInput,
   ) => Effect.Effect<void, OrchestrationV2StopWorkflowError>;
+  /**
+   * Kills the thread's agent for a provider that no longer responds, then ends
+   * its turn as interrupted. Never kills a process other working threads share.
+   */
+  readonly forceStopThread: (
+    input: OrchestrationV2ForceStopThreadInput,
+  ) => Effect.Effect<OrchestrationV2ForceStopThreadResult, OrchestrationV2ForceStopThreadError>;
   readonly awaitBackgroundTasks: (input: {
     readonly threadId: ThreadId;
     readonly taskIds: ReadonlyArray<string>;
@@ -547,12 +560,14 @@ function latestSteerableRun(
 }
 
 const SETTLE_AFTER_RUN_WAIT_MS = 24 * 60 * 60 * 1_000;
+const FORCE_STOP_REASON = "Force stopped by user";
 
 const make = Effect.gen(function* () {
   const threadDispatch = yield* ThreadCommandExecutor.ThreadCommandExecutor;
   const orchestrator = yield* Orchestrator.OrchestratorV2;
   const sessions = yield* ProviderSessionManager.ProviderSessionManagerV2;
   const layerScope = yield* Effect.scope;
+  const agentScope = yield* AgentScope;
   const legacyImporter = yield* LegacyV1ThreadImporter.LegacyV1ThreadImporter;
   const serverSettings = yield* ServerSettings.ServerSettingsService;
   const receipts = yield* CommandReceiptStore.CommandReceiptStoreV2;
@@ -1072,6 +1087,119 @@ const make = Effect.gen(function* () {
     return { type: "interrupt_requested", run: interruptibleRun, dispatch } as const;
   });
 
+  const forceStopThread: ThreadManagementServiceShape["forceStopThread"] = Effect.fn(
+    "ThreadManagementService.forceStopThread",
+  )(
+    function* (input) {
+      const records = yield* orchestrator.getThreadRecords(input.threadId, [
+        "runs",
+        "providerThreads",
+        "providerTurns",
+      ]);
+      const releasable: Array<ProviderSessionId> = [];
+      const shared: Array<ProviderSessionId> = [];
+      const sharedWith = new Set<ThreadId>();
+      const sessionIds = new Set(
+        records.providerThreads.flatMap((providerThread) =>
+          providerThread.appThreadId === input.threadId && providerThread.providerSessionId !== null
+            ? [providerThread.providerSessionId]
+            : [],
+        ),
+      );
+      for (const providerSessionId of sessionIds) {
+        if (!(yield* sessions.isLive(providerSessionId))) continue;
+        const others = yield* sessions.otherWorkingThreads({
+          providerSessionId,
+          threadId: input.threadId,
+        });
+        if (others.length === 0) {
+          releasable.push(providerSessionId);
+        } else {
+          shared.push(providerSessionId);
+          for (const threadId of others) sharedWith.add(threadId);
+        }
+      }
+      // Shared scopes are never tracked per thread, so this only kills the thread's own agent.
+      const killed = yield* agentScope.kill(input.threadId);
+      const run = latestActiveRun(records);
+      if (run !== undefined) {
+        const providerTurn = records.providerTurns.findLast(
+          (turn) => turn.runAttemptId === run.activeAttemptId && turn.status === "running",
+        );
+        const commandId = CommandId.make(
+          `server:force-stop:${run.id}:${yield* Clock.currentTimeMillis}`,
+        );
+        yield* providerTurn === undefined
+          ? orchestrator.dispatch({
+              type: "run.interrupt",
+              commandId,
+              threadId: input.threadId,
+              runId: run.id,
+              reason: FORCE_STOP_REASON,
+            })
+          : orchestrator.dispatch({
+              type: "thread.background-work.settle",
+              commandId,
+              threadId: input.threadId,
+              providerThreadId: providerTurn.providerThreadId,
+              providerTurnId: providerTurn.id,
+              reason: FORCE_STOP_REASON,
+            });
+      }
+      // Teardown waits on the provider's own exit paths, so it must not hold up the reply.
+      yield* Effect.forEach(
+        [
+          // Checked again at teardown: another thread may have started work on it meanwhile.
+          ...releasable.map((providerSessionId) =>
+            sessions.otherWorkingThreads({ providerSessionId, threadId: input.threadId }).pipe(
+              Effect.flatMap((others) =>
+                others.length === 0
+                  ? sessions.release({
+                      providerSessionId,
+                      reason: "manual_shutdown",
+                      detail: FORCE_STOP_REASON,
+                    })
+                  : sessions.detach({
+                      providerSessionId,
+                      threadId: input.threadId,
+                      detail: FORCE_STOP_REASON,
+                    }),
+              ),
+            ),
+          ),
+          ...shared.map((providerSessionId) =>
+            sessions.detach({
+              providerSessionId,
+              threadId: input.threadId,
+              detail: FORCE_STOP_REASON,
+            }),
+          ),
+        ],
+        (teardown) =>
+          teardown.pipe(
+            Effect.catchCause((cause) =>
+              Effect.logWarning("orchestration-v2.force-stop-teardown-failed", {
+                threadId: input.threadId,
+                cause,
+              }),
+            ),
+            Effect.forkIn(layerScope),
+          ),
+        { discard: true },
+      );
+      return {
+        outcome: killed ? "killed" : shared.length > 0 ? "shared" : "released",
+        sharedWithThreadIds: [...sharedWith],
+      } as const;
+    },
+    (effect, input) =>
+      effect.pipe(
+        Effect.mapError(
+          (cause) => new OrchestrationV2ForceStopThreadError({ threadId: input.threadId, cause }),
+        ),
+      ),
+  );
+
   const stopWorkflow: ThreadManagementServiceShape["stopWorkflow"] = Effect.fn(
     "ThreadManagementService.stopWorkflow",
   )(
@@ -1354,6 +1482,7 @@ const make = Effect.gen(function* () {
     interruptThread,
     stopDelegatedTasks,
     stopWorkflow,
+    forceStopThread,
     awaitBackgroundTasks,
     getThreadEventSequence: orchestrator.getThreadEventSequence,
     recoverDelegatedTask: orchestrator.recoverDelegatedTask,

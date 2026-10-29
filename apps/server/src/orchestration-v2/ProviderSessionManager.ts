@@ -56,6 +56,8 @@ import * as ProjectionStore from "./ProjectionStore.ts";
 const DEFAULT_IDLE_TIMEOUT_MS = 30 * 60 * 1000;
 const DEFAULT_MAX_IDLE_PIN_MS = 4 * 60 * 60 * 1000;
 const RELEASE_SCOPE_CLOSE_TIMEOUT_MS = 30 * 1000;
+/** Past adapters' own 10 s stop fallbacks, so they settle first when the provider answers at all. */
+export const PROVIDER_INTERRUPT_TIMEOUT_MS = 15 * 1000;
 
 const busyTurnPrefix = (providerThreadId: ProviderThreadId) => `${providerThreadId}#`;
 const busyTurnKey = (providerThreadId: ProviderThreadId, runOrdinal: number) =>
@@ -180,6 +182,11 @@ export interface ProviderSessionManagerV2Shape {
     readonly detail?: string;
     readonly revokeMcpCredential?: boolean;
   }) => Effect.Effect<void, ProviderSessionManagerV2Error>;
+  /** Other threads with a run on this session's shared process; empty when it serves one thread. */
+  readonly otherWorkingThreads: (input: {
+    readonly providerSessionId: ProviderSessionId;
+    readonly threadId: ThreadId;
+  }) => Effect.Effect<ReadonlyArray<ThreadId>>;
 }
 
 export class ProviderSessionManagerV2 extends Context.Service<
@@ -1807,9 +1814,26 @@ export const layerWithOptions = (
             observeActivity(providerSessionId, touchActivity(providerSessionId)).pipe(
               Effect.andThen(runtime.steerTurn(input).pipe(turnMetrics("steer"))),
             ),
+          // A provider starved of memory can stop answering, so no caller may wait on it unbounded.
           interruptTurn: (input) =>
             observeActivity(providerSessionId, touchActivity(providerSessionId)).pipe(
-              Effect.andThen(runtime.interruptTurn(input).pipe(turnMetrics("interrupt"))),
+              Effect.andThen(
+                runtime.interruptTurn(input).pipe(
+                  Effect.timeoutOrElse({
+                    duration: PROVIDER_INTERRUPT_TIMEOUT_MS,
+                    orElse: () =>
+                      Effect.fail(
+                        new ProviderAdapter.ProviderAdapterInterruptTimeoutError({
+                          driver: runtime.driver,
+                          providerThreadId: input.providerThread.id,
+                          providerTurnId: input.providerTurnId,
+                          timeoutMs: PROVIDER_INTERRUPT_TIMEOUT_MS,
+                        }),
+                      ),
+                  }),
+                  turnMetrics("interrupt"),
+                ),
+              ),
             ),
           respondToRuntimeRequest: (input) =>
             observeActivity(providerSessionId, touchActivity(providerSessionId)).pipe(
@@ -2269,6 +2293,21 @@ export const layerWithOptions = (
             ),
         ),
         release: releaseEntry,
+        otherWorkingThreads: Effect.fn("ProviderSessionManager.otherWorkingThreads")(
+          function* (input) {
+            const entry = (yield* Ref.get(sessions)).get(sessionKey(input.providerSessionId));
+            if (entry === undefined || !entry.supportsMultipleProviderThreads) return [];
+            return yield* Effect.filter(
+              [...entry.attachedThreadIds].filter((threadId) => threadId !== input.threadId),
+              (threadId) =>
+                projectionStore.getThreadShell(threadId).pipe(
+                  Effect.map((shell) => shell !== null && shell.activeRunId !== null),
+                  // An unreadable thread may still be working; never kill it unseen.
+                  Effect.orElseSucceed(() => true),
+                ),
+            );
+          },
+        ),
         detach: Effect.fn("ProviderSessionManager.detach")(
           function* (input) {
             const key = sessionKey(input.providerSessionId);

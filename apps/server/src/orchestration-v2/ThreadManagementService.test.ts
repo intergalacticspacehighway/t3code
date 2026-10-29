@@ -27,6 +27,8 @@ import * as Queue from "effect/Queue";
 import * as Stream from "effect/Stream";
 import * as TestClock from "effect/testing/TestClock";
 
+import { AgentScope } from "@t3tools/shared/AgentScope";
+
 import * as ServerSettings from "../serverSettings.ts";
 import * as SqlitePersistence from "../persistence/Sqlite.ts";
 import * as CommandReceiptStore from "./CommandReceiptStore.ts";
@@ -594,5 +596,104 @@ it.effect.each([
     yield* service.settleAfterRun({ projectId, threadId, runId });
 
     expect(dispatched).toEqual(settles ? ["thread.settle"] : []);
+  }),
+);
+
+it.effect.each([
+  {
+    name: "kills the thread's own agent and ends its turn",
+    others: [] as ReadonlyArray<string>,
+    killed: true,
+    expected: { outcome: "killed", sharedWithThreadIds: [] },
+    teardown: "release",
+  },
+  {
+    name: "detaches instead when another thread starts work before teardown",
+    others: [] as ReadonlyArray<string>,
+    othersAtTeardown: ["thread:thread-management:force-stop:other"],
+    killed: false,
+    expected: { outcome: "released", sharedWithThreadIds: [] },
+    teardown: "detach",
+  },
+  {
+    name: "keeps a process another working thread shares and only ends this turn",
+    others: ["thread:thread-management:force-stop:other"],
+    killed: false,
+    expected: {
+      outcome: "shared",
+      sharedWithThreadIds: ["thread:thread-management:force-stop:other"],
+    },
+    teardown: "detach",
+  },
+])("Force stop $name", ({ others, killed, expected, teardown, ...row }) =>
+  Effect.gen(function* () {
+    const threadId = ThreadId.make("thread:thread-management:force-stop");
+    const providerSessionId = ProviderSessionId.make("provider-session:force-stop");
+    const providerThreadId = ProviderThreadId.make("provider-thread:force-stop");
+    const runId = RunId.make("run:thread-management:force-stop");
+    const dispatched: Array<OrchestrationV2Command | { readonly type: string }> = [];
+    const tornDown = yield* Deferred.make<string>();
+    let checks = 0;
+    const layerTest = ThreadManagementService.layer.pipe(
+      Layer.provide(
+        Layer.mock(ProviderSessionManager.ProviderSessionManagerV2)({
+          isLive: () => Effect.succeed(true),
+          otherWorkingThreads: () =>
+            Effect.sync(() =>
+              (checks++ === 0
+                ? others
+                : "othersAtTeardown" in row
+                  ? row.othersAtTeardown
+                  : others
+              ).map((id) => ThreadId.make(id)),
+            ),
+          release: () => Deferred.succeed(tornDown, "release").pipe(Effect.asVoid),
+          detach: () => Deferred.succeed(tornDown, "detach").pipe(Effect.asVoid),
+        }),
+      ),
+      Layer.provide(
+        Layer.mock(Orchestrator.OrchestratorV2)({
+          getThreadRecords: () =>
+            Effect.succeed({
+              thread: { id: threadId, deletedAt: null },
+              runs: [{ id: runId, ordinal: 1, status: "running", activeAttemptId: "attempt" }],
+              providerThreads: [{ id: providerThreadId, appThreadId: threadId, providerSessionId }],
+              providerTurns: [
+                {
+                  id: "provider-turn:force-stop",
+                  providerThreadId,
+                  runAttemptId: "attempt",
+                  status: "running",
+                },
+              ],
+            } as unknown as OrchestrationV2ThreadProjection),
+          dispatch: (command) =>
+            Effect.sync(() => {
+              dispatched.push(command);
+              return { sequence: 1, storedEvents: [] } as never;
+            }),
+        }),
+      ),
+      Layer.provide(
+        Layer.succeed(AgentScope, {
+          ...AgentScope.defaultValue(),
+          kill: () => Effect.succeed(killed),
+        }),
+      ),
+      Layer.provide(ServerSettings.layerTest()),
+      Layer.provide(layerReceiptsTest),
+    );
+    yield* Effect.gen(function* () {
+      const service = yield* ThreadManagementService.ThreadManagementService;
+      expect(yield* service.forceStopThread({ threadId })).toEqual(expected);
+      expect(dispatched).toMatchObject([
+        {
+          type: "thread.background-work.settle",
+          providerThreadId,
+          reason: "Force stopped by user",
+        },
+      ]);
+      expect(yield* Deferred.await(tornDown)).toBe(teardown);
+    }).pipe(Effect.provide(layerTest));
   }),
 );
